@@ -3133,6 +3133,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q4_K], "get_rows_q4_k", get_rows_q4_k_len, get_rows_q4_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q5_K], "get_rows_q5_k", get_rows_q5_k_len, get_rows_q5_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_Q6_K], "get_rows_q6_k", get_rows_q6_k_len, get_rows_q6_k_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+
+#define CREATE_DQT(TYPE, name) \
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose_f16[TYPE], "dqt_" #name, dqt_##name##_len, dqt_##name##_data, \
+        "main", 2, 3 * sizeof(uint32_t), {256, 16, 1}, {}, 1);
+    CREATE_DQT(GGML_TYPE_Q4_0, q4_0)
+    CREATE_DQT(GGML_TYPE_Q4_1, q4_1)
+    CREATE_DQT(GGML_TYPE_Q5_0, q5_0)
+    CREATE_DQT(GGML_TYPE_Q5_1, q5_1)
+    CREATE_DQT(GGML_TYPE_Q8_0, q8_0)
+    CREATE_DQT(GGML_TYPE_Q2_K, q2_k)
+    CREATE_DQT(GGML_TYPE_Q3_K, q3_k)
+    CREATE_DQT(GGML_TYPE_Q4_K, q4_k)
+    CREATE_DQT(GGML_TYPE_Q5_K, q5_k)
+    CREATE_DQT(GGML_TYPE_Q6_K, q6_k)
+    CREATE_DQT(GGML_TYPE_IQ4_NL, iq4_nl)
+    CREATE_DQT(GGML_TYPE_IQ4_XS, iq4_xs)
+#undef CREATE_DQT
+
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TQ1_0], "get_rows_tq1_0", get_rows_tq1_0_len, get_rows_tq1_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TQ2_0], "get_rows_tq2_0", get_rows_tq2_0_len, get_rows_tq2_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_IQ1_S],   "get_rows_iq1_s",   get_rows_iq1_s_len,   get_rows_iq1_s_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
@@ -3737,6 +3755,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+            }
+        }
+    }
+
+    {
+        const uint32_t gdn_sizes[] = {16, 32, 64, 128};
+        for (uint32_t si = 0; si < 4; si++) {
+            for (uint32_t kda = 0; kda < 2; kda++) {
+                const std::string name = "gated_delta_net_back_f32_d" + std::to_string(gdn_sizes[si]) + (kda ? "_kda" : "");
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_back[si][kda], name.c_str(),
+                    gated_delta_net_back_f32_len, gated_delta_net_back_f32_data, "main", 8,
+                    sizeof(vk_op_gated_delta_net_back_push_constants), {1, 1, 1}, {gdn_sizes[si], kda, (gdn_sizes[si] / 8) * (gdn_sizes[si] / 8)}, 1);
             }
         }
     }
@@ -5504,6 +5534,54 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     const char* output_tensor = getenv("GGML_VULKAN_OUTPUT_TENSOR");
     vk_output_tensor = (output_tensor == NULL ? 0 : atoi(output_tensor));
 #endif
+}
+
+// A 2-D transposed view of contiguous quantized rows, of a type with a
+// dequantize-and-transpose shader.
+static bool ggml_vk_is_quant_transpose(const ggml_tensor * t) {
+    switch (t->type) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
+            break;
+        default:
+            return false;
+    }
+    return t->ne[2] == 1 && t->ne[3] == 1 && t->nb[1] == ggml_type_size(t->type) &&
+        t->nb[0] % ggml_type_size(t->type) == 0 && t->ne[1] % ggml_blck_size(t->type) == 0;
+}
+
+static bool ggml_vk_has_to_fp16(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ2_0:
+            return true;
+        default:
+            return false;
+    }
 }
 
 vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
@@ -9232,6 +9310,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
+    case GGML_OP_GATED_DELTA_NET_BACK:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            const uint32_t S_v = dst->src[2]->ne[0];
+            const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
+            uint32_t si;
+            switch (S_v) {
+                case 16:  si = 0; break;
+                case 32:  si = 1; break;
+                case 64:  si = 2; break;
+                case 128: si = 3; break;
+                default: return nullptr;
+            }
+            return ctx->device->pipeline_gated_delta_net_back[si][kda];
+        }
+        return nullptr;
     case GGML_OP_SSM_SCAN:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t d_state = src0->ne[0];
@@ -10346,6 +10439,56 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         pc, { H, n_seqs, S_v });
 }
 
+void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src_q = dst->src[0];
+    const ggml_tensor * src_k = dst->src[1];
+    const ggml_tensor * src_v = dst->src[2];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t S  = (uint32_t)src_v->ne[0];
+    const uint32_t H  = (uint32_t)src_v->ne[1];
+    const uint32_t T  = (uint32_t)src_v->ne[2];
+    const uint32_t B  = (uint32_t)src_v->ne[3];
+    const uint32_t C  = (uint32_t)ggml_get_op_params_i32(dst, 0);
+    const uint32_t nck = (T + C - 1) / C;
+
+    // the regions of dst, as ggml_gated_delta_net_back documents them
+    const uint32_t nv     = (uint32_t)ggml_nelements(src_v);
+    const uint32_t off_dk = nv;
+    const uint32_t off_dv = 2 * nv;
+    const uint32_t off_dg = 3 * nv;
+    const uint32_t off_db = off_dg + (uint32_t)ggml_nelements(dst->src[3]);
+    const uint32_t off_ds = off_db + (uint32_t)ggml_nelements(dst->src[4]);
+    const uint32_t off_scr = off_ds + (uint32_t)ggml_nelements(dst->src[5]);
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer src_buf[7] = {};
+    for (int i = 0; i < 7; i++) {
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+
+    const vk_op_gated_delta_net_back_push_constants pc = {
+        H, T, B, (uint32_t)src_k->ne[1],
+        (uint32_t)(src_q->nb[1] / sizeof(float)), (uint32_t)(src_q->nb[2] / sizeof(float)), (uint32_t)(src_q->nb[3] / sizeof(float)),
+        (uint32_t)(src_k->nb[1] / sizeof(float)), (uint32_t)(src_k->nb[2] / sizeof(float)), (uint32_t)(src_k->nb[3] / sizeof(float)),
+        (uint32_t)(src_v->nb[1] / sizeof(float)), (uint32_t)(src_v->nb[2] / sizeof(float)), (uint32_t)(src_v->nb[3] / sizeof(float)),
+        C, nck,
+        off_dk, off_dv, off_dg, off_db, off_ds, off_scr,
+        S * H * T * B,
+        1.0f / sqrtf((float)S),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], dst_buf},
+        pc, { H, B, 1 });
+}
+
 void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -10703,6 +10846,37 @@ void ggml_vk_repeat_back(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 }
 
 void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    if (ggml_vk_is_quant_transpose(src0) && dst->type == GGML_TYPE_F16) {
+        // the transpose of quantized rows: dequantize and transpose in one pass
+        GGML_ASSERT(ggml_is_contiguous(dst));
+        vk_pipeline pipeline = ctx->device->pipeline_dequant_transpose_f16[src0->type];
+        GGML_ASSERT(pipeline != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const uint32_t k = (uint32_t)src0->ne[1];
+        const uint32_t n = (uint32_t)src0->ne[0];
+        const uint32_t row_blocks = (uint32_t)(src0->nb[0] / ggml_type_size(src0->type));
+        const std::vector<uint32_t> pc = { k, n, row_blocks };
+        // ggml_nbytes divides the transposed rows by the block size; bind all of them
+        vk_subbuffer a = ggml_vk_tensor_subbuffer(ctx, src0);
+        a.size = (size_t)n * src0->nb[0];
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, ggml_vk_tensor_subbuffer(ctx, dst) }, pc,
+            { k, n, 1 });
+        return;
+    }
+    if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F16) {
+        // contiguous rows, through the dequant shader of the matmul path
+        GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+        vk_pipeline pipeline = ggml_vk_get_to_fp16(ctx, src0->type);
+        GGML_ASSERT(pipeline != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const uint32_t k = (uint32_t)src0->ne[0];
+        const uint32_t m = (uint32_t)(ggml_nelements(src0) / src0->ne[0]);
+        const std::vector<uint32_t> pc = { m, k, k, k, (uint32_t)ggml_nelements(src0) };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, dst) }, pc,
+            { (uint32_t)ggml_nelements(src0), 1, 1 });
+        return;
+    }
     uint32_t ne = (uint32_t)ggml_nelements(src0);
     if (ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
         // Convert from number of logical elements to 2- or 4-byte units.
@@ -12884,6 +13058,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_GATED_DELTA_NET_BACK:
+        ggml_vk_gated_delta_net_back(ctx, compute_ctx, node);
 
         break;
 
@@ -15833,6 +16012,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return true;
                 }
 
+                // dequantize to f16 through the matmul dequant shaders
+                if (ggml_is_quantized(src0_type) && src1_type == GGML_TYPE_F16 &&
+                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                    ggml_vk_has_to_fp16(src0_type)) {
+                    return true;
+                }
+                if (src1_type == GGML_TYPE_F16 && ggml_vk_is_quant_transpose(op->src[0]) &&
+                    ggml_is_contiguous(op)) {
+                    return true;
+                }
+
                 if (
                     (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) ||
                     (src0_type == GGML_TYPE_I32 && src1_type == GGML_TYPE_F32)
@@ -15883,7 +16073,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->type == GGML_TYPE_F32;
         case GGML_OP_SILU_BACK:
         case GGML_OP_RMS_NORM_BACK:
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_SIN:
@@ -16103,6 +16293,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 for (int i = 0; i < 6; i++) {
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                return op->type == GGML_TYPE_F32;
+            }
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                const int64_t S_v = op->src[2]->ne[0];
+                if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
+                    return false;
+                }
+                for (int i = 0; i < 7; i++) {
+                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32 ||
+                        !ggml_is_contiguous_rows(op->src[i])) {
                         return false;
                     }
                 }

@@ -704,6 +704,18 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+struct vk_op_gated_delta_net_back_push_constants {
+    uint32_t H, T, B, Hk;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sk1, sk2, sk3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t C, nck;
+    uint32_t off_dk, off_dv, off_dg, off_db, off_ds, off_scr;
+    uint32_t dy_st;
+    float scale;
+};
+static_assert(sizeof(vk_op_gated_delta_net_back_push_constants) <= 128);
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;

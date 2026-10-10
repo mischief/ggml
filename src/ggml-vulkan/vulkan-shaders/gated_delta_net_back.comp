@@ -1,0 +1,246 @@
+#version 450
+
+// Gradients of gated_delta_net (K == 1). One workgroup takes one value
+// head of one sequence. The state M is stored as in the forward pass:
+// M[j*S_V + i] = S[i][j]. Each invocation keeps an 8x8 tile of the
+// state and of its gradient in registers; row and column sums go
+// through shared memory. The states, kept every C tokens and recomputed
+// for one chunk at a time, live in the scratch of dst.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint S_V = 128;
+layout(constant_id = 1) const uint KDA = 0;
+layout(constant_id = 2) const uint NT = 256;   // (S_V / TB)^2 invocations
+
+const uint TB = 8;              // tile side
+const uint NB = S_V / TB;       // tiles per side
+
+layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint H, T, B, Hk;
+    uint sq1, sq2, sq3;
+    uint sk1, sk2, sk3;
+    uint sv1, sv2, sv3;
+    uint C, nck;
+    uint off_dk, off_dv, off_dg, off_db, off_ds, off_scr;
+    uint dy_st;
+    float scale;
+};
+
+layout(binding = 0) readonly buffer QBuf     { float data_q[];     };
+layout(binding = 1) readonly buffer KBuf     { float data_k[];     };
+layout(binding = 2) readonly buffer VBuf     { float data_v[];     };
+layout(binding = 3) readonly buffer GBuf     { float data_g[];     };
+layout(binding = 4) readonly buffer BetaBuf  { float data_beta[];  };
+layout(binding = 5) readonly buffer StateBuf { float data_state[]; };
+layout(binding = 6) readonly buffer DyBuf    { float data_dy[];    };
+layout(binding = 7)          buffer DstBuf   { float data_dst[];   };
+
+shared float sk[S_V], sq[S_V], sv[S_V], sdo[S_V], sea[S_V], ska[S_V], sd[S_V], sdu[S_V];
+// partial sums: [tile column][row] for row sums, [tile row][column] for column sums
+shared float red0[NB * S_V], red1[NB * S_V], red2[NB * S_V], red3[NB * S_V];
+shared float ssum[64];
+shared float sbeta;
+
+uint ih, is, ik, tid, j0, i0;
+
+// The sum of x over the workgroup, in every invocation.
+float wg_sum(float x) {
+    x = subgroupAdd(x);
+    if (subgroupElect()) {
+        ssum[gl_SubgroupID] = x;
+    }
+    barrier();
+    float s = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) {
+        s += ssum[i];
+    }
+    barrier();
+    return s;
+}
+
+// Loads the inputs of token t into shared memory.
+void load_token(uint t) {
+    barrier();
+    const uint gi = (is * T + t) * H + ih;
+    for (uint x = tid; x < S_V; x += NT) {
+        sk[x]  = data_k[is * sk3 + t * sk2 + ik * sk1 + x];
+        sq[x]  = data_q[is * sq3 + t * sq2 + ik * sq1 + x];
+        sv[x]  = data_v[is * sv3 + t * sv2 + ih * sv1 + x];
+        sdo[x] = data_dy[((is * T + t) * H + ih) * S_V + x];
+        sea[x] = exp(KDA != 0 ? data_g[gi * S_V + x] : data_g[gi]);
+        ska[x] = sea[x] * sk[x];
+    }
+    if (tid == 0) {
+        sbeta = data_beta[gi];
+    }
+    barrier();
+}
+
+void main() {
+    ih  = gl_WorkGroupID.x;
+    is  = gl_WorkGroupID.y;
+    ik  = ih % Hk;
+    tid = gl_LocalInvocationIndex;
+    const uint tr = tid / NB, tc = tid % NB;
+    j0  = tr * TB;
+    i0  = tc * TB;
+
+    const uint SS  = S_V * S_V;
+    const uint ck  = off_scr + (is * H + ih) * (nck + C + 1) * SS;
+    const uint buf = ck + nck * SS;
+
+    float M[TB * TB];
+    float G[TB * TB];
+
+#define LOAD_TILE(dst, src_base, arr) \
+    [[unroll]] for (uint a = 0; a < TB; a++) [[unroll]] for (uint b = 0; b < TB; b++) \
+        dst[a * TB + b] = arr[(src_base) + (j0 + a) * S_V + i0 + b];
+#define STORE_TILE(src, dst_base) \
+    [[unroll]] for (uint a = 0; a < TB; a++) [[unroll]] for (uint b = 0; b < TB; b++) \
+        data_dst[(dst_base) + (j0 + a) * S_V + i0 + b] = src[a * TB + b];
+
+// One forward step on the tile M, for the token in shared memory:
+// M = exp(g) * M; d = beta (v - M^T k); M += d k^T
+#define STEP_M() { \
+    [[unroll]] for (uint a = 0; a < TB; a++) { \
+        float p = 0.0; \
+        [[unroll]] for (uint b = 0; b < TB; b++) { \
+            M[a * TB + b] *= sea[i0 + b]; \
+            p += M[a * TB + b] * sk[i0 + b]; \
+        } \
+        red0[tc * S_V + j0 + a] = p; \
+    } \
+    barrier(); \
+    for (uint x = tid; x < S_V; x += NT) { \
+        float u = 0.0; \
+        for (uint c = 0; c < NB; c++) u += red0[c * S_V + x]; \
+        sd[x] = sbeta * (sv[x] - u); \
+    } \
+    barrier(); \
+    [[unroll]] for (uint a = 0; a < TB; a++) [[unroll]] for (uint b = 0; b < TB; b++) \
+        M[a * TB + b] += sd[j0 + a] * sk[i0 + b]; \
+}
+
+    // states at the chunk starts
+    LOAD_TILE(M, (is * H + ih) * SS, data_state)
+    STORE_TILE(M, ck)
+    for (uint c = 0; c + 1 < nck; c++) {
+        for (uint t = c * C; t < (c + 1) * C; t++) {
+            load_token(t);
+            STEP_M()
+        }
+        STORE_TILE(M, ck + (c + 1) * SS)
+    }
+
+    LOAD_TILE(G, dy_st + (is * H + ih) * SS, data_dy)
+
+    for (int c = int(nck) - 1; c >= 0; c--) {
+        const uint t0 = uint(c) * C;
+        const uint t1 = min(T, t0 + C);
+        // the states before each token of the chunk; each invocation
+        // reads back only its own tile, so no barrier is needed
+        LOAD_TILE(M, ck + uint(c) * SS, data_dst)
+        for (uint t = t0; t < t1; t++) {
+            STORE_TILE(M, buf + (t - t0) * SS)
+            if (t + 1 < t1) {
+                load_token(t);
+                STEP_M()
+            }
+        }
+
+        for (int ti = int(t1) - 1; ti >= int(t0); ti--) {
+            const uint t = uint(ti);
+            load_token(t);
+            LOAD_TILE(M, buf + (t - t0) * SS, data_dst)   // the state before token t
+            const uint o  = ((is * T + t) * H + ih) * S_V;
+            const uint gi = (is * T + t) * H + ih;
+            const float beta = sbeta;
+
+            // the output: G += scale dO q^T; row sums of M' k and G k
+            [[unroll]] for (uint a = 0; a < TB; a++) {
+                float pu = 0.0, pd = 0.0;
+                [[unroll]] for (uint b = 0; b < TB; b++) {
+                    G[a * TB + b] += scale * sdo[j0 + a] * sq[i0 + b];
+                    pu += M[a * TB + b] * ska[i0 + b];
+                    pd += G[a * TB + b] * sk[i0 + b];
+                }
+                red0[tc * S_V + j0 + a] = pu;
+                red1[tc * S_V + j0 + a] = pd;
+            }
+            barrier();
+            float pb = 0.0, pod = 0.0, pud = 0.0;
+            for (uint x = tid; x < S_V; x += NT) {
+                float u = 0.0, dd = 0.0;
+                for (uint r = 0; r < NB; r++) {
+                    u  += red0[r * S_V + x];
+                    dd += red1[r * S_V + x];
+                }
+                const float d  = beta * (sv[x] - u);
+                const float du = -beta * dd;
+                sd[x]  = d;
+                sdu[x] = du;
+                data_dst[off_dv + o + x] = beta * dd;
+                pb  += dd * (sv[x] - u);
+                pod += sdo[x] * d;
+                pud += du * d;
+            }
+            barrier();
+            const float db  = wg_sum(pb);
+            const float dOd = wg_sum(pod);
+            const float dud = wg_sum(pud);
+            if (tid == 0) {
+                data_dst[off_db + gi] = db;
+            }
+
+            // u = M'^T k: G += du k^T; column sums
+            [[unroll]] for (uint b = 0; b < TB; b++) {
+                float a1 = 0.0, a2 = 0.0, a3 = 0.0, da = 0.0;
+                [[unroll]] for (uint a = 0; a < TB; a++) {
+                    G[a * TB + b] += sdu[j0 + a] * sk[i0 + b];
+                    a1 += G[a * TB + b] * sd[j0 + a];
+                    a2 += M[a * TB + b] * sdu[j0 + a];
+                    a3 += M[a * TB + b] * sdo[j0 + a];
+                    da += G[a * TB + b] * M[a * TB + b];
+                }
+                red0[tr * S_V + i0 + b] = a1;
+                red1[tr * S_V + i0 + b] = a2;
+                red2[tr * S_V + i0 + b] = a3;
+                red3[tr * S_V + i0 + b] = da;
+            }
+            barrier();
+            float pda = 0.0;
+            for (uint x = tid; x < S_V; x += NT) {
+                float a1 = 0.0, a2 = 0.0, a3 = 0.0, da = 0.0;
+                for (uint r = 0; r < NB; r++) {
+                    a1 += red0[r * S_V + x];
+                    a2 += red1[r * S_V + x];
+                    a3 += red2[r * S_V + x];
+                    da += red3[r * S_V + x];
+                }
+                data_dst[off_dk + o + x] = a1 - sk[x] * dud + sea[x] * a2;
+                data_dst[o + x] = scale * (sea[x] * a3 + sk[x] * dOd);
+                if (KDA != 0) {
+                    data_dst[off_dg + gi * S_V + x] = da * sea[x];
+                } else {
+                    pda += da;
+                }
+            }
+            if (KDA == 0) {
+                const float das = wg_sum(pda);
+                if (tid == 0) {
+                    data_dst[off_dg + gi] = das * sea[0];
+                }
+            }
+            // M' = exp(g) * M
+            [[unroll]] for (uint a = 0; a < TB; a++) [[unroll]] for (uint b = 0; b < TB; b++)
+                G[a * TB + b] *= sea[i0 + b];
+        }
+    }
+
+    STORE_TILE(G, off_ds + (is * H + ih) * SS)
+}

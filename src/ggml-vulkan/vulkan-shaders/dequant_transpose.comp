@@ -1,0 +1,72 @@
+#version 450
+
+// Dequantize contiguous rows of a quantized matrix and write the
+// transpose as f16: row r, column c of the source goes to d[c*N + r].
+// A workgroup takes a tile of TR rows by TC columns through shared
+// memory, so both the reads and the writes are coalesced.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.glsl"
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+#if defined(A_TYPE_PACKED16)
+layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
+layout (binding = 1) writeonly buffer D {float16_t data_d[];};
+
+#include "dequant_funcs.glsl"
+
+layout (push_constant) uniform parameter {
+    uint K;            // columns: the length of a source row
+    uint N;            // rows
+    uint row_blocks;   // blocks between the starts of two source rows
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint TC = 256;   // a multiple of every QUANT_K
+const uint TR = 16;
+
+shared float tile[TR][TC];
+
+void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
+    const uint c0 = gl_WorkGroupID.x * TC;
+    const uint r0 = gl_WorkGroupID.y * TR;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint y_offset = QUANT_R == 1 ? 1 : QUANT_K / 2;
+
+    // each invocation dequantizes value pairs, as get_rows does
+    [[unroll]] for (uint pp = 0; pp < TR * TC / 2 / 256; pp++) {
+        const uint pair = tid + pp * 256;
+        const uint r = pair / (TC / 2);
+        const uint i00 = c0 + (pair % (TC / 2)) * 2;
+        if (r0 + r < p.N && i00 < p.K) {
+            const uint ib = (r0 + r) * p.row_blocks + i00 / QUANT_K;
+            const uint iqs = (i00 % QUANT_K) / QUANT_R;
+            const uint iybs = i00 - i00 % QUANT_K;
+            vec2 v = dequantize(ib, iqs, 0);
+            const vec2 dm = get_dm(ib, 0);
+            v = v * dm.x + dm.y;
+            tile[r][iybs + iqs - c0] = v.x;
+            tile[r][iybs + iqs + y_offset - c0] = v.y;
+        }
+    }
+    barrier();
+
+    [[unroll]] for (uint q = 0; q < TR * TC / 256; q++) {
+        const uint e = tid + q * 256;
+        const uint c = e / TR;
+        const uint r = e % TR;
+        if (r0 + r < p.N && c0 + c < p.K) {
+            data_d[(c0 + c) * p.N + r0 + r] = float16_t(tile[r][c]);
+        }
+    }
+}

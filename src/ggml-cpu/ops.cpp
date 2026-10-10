@@ -11410,6 +11410,246 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_gated_delta_net_back
+//
+// The state M is stored as in the forward pass: M[j*S + i] = S[i][j].
+// The backward pass keeps a state every C tokens, then recomputes the
+// states of one chunk at a time, last chunk first. The states live in
+// the scratch at the end of dst.
+
+size_t ggml_gated_delta_net_back_work(const ggml_tensor * dst) {
+    return (8 * dst->src[2]->ne[0] + CACHE_LINE_SIZE_F32) * sizeof(float);
+}
+
+// exp of the gate for one token: S values (KDA) or one
+static void gdn_gate(int64_t S, bool kda, const float * g, float * ea) {
+    const int64_t n = kda ? S : 1;
+    for (int64_t i = 0; i < n; ++i) {
+        ea[i] = expf(g[i]);
+    }
+}
+
+// One forward step on M, as the forward kernel does it.
+static void gdn_step(int64_t S, bool kda, float * M, const float * ea,
+        const float * k, const float * v, float beta) {
+    for (int64_t j = 0; j < S; ++j) {
+        float * row = M + j * S;
+        if (kda) {
+            ggml_vec_mul_f32(S, row, row, ea);
+        } else {
+            ggml_vec_scale_f32(S, row, ea[0]);
+        }
+        float sum = 0.0f;
+        ggml_vec_dot_f32(S, &sum, 0, row, 0, k, 0, 1);
+        ggml_vec_mad_f32(S, row, k, (v[j] - sum) * beta);
+    }
+}
+
+static void ggml_compute_forward_gated_delta_net_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_dy    = dst->src[6];
+
+    const int64_t S  = src_v->ne[0];
+    const int64_t H  = src_v->ne[1];
+    const int64_t T  = src_v->ne[2];
+    const int64_t B  = src_v->ne[3];
+    const int64_t Hk = src_k->ne[1];
+    const int64_t ng = src_g->ne[0];
+    const bool kda   = ng == S;
+
+    GGML_ASSERT(src_q->ne[1] == Hk && H % Hk == 0);
+    GGML_ASSERT(ggml_is_contiguous(src_g) && ggml_is_contiguous(src_beta));
+    GGML_ASSERT(ggml_is_contiguous(src_state) && ggml_is_contiguous(src_dy));
+
+    const float scale = 1.0f / sqrtf((float) S);
+    const int64_t SS  = S * S;
+    const int64_t C   = ggml_get_op_params_i32(dst, 0);
+    const int64_t nck = (T + C - 1) / C;
+
+    // gradients and scratch, packed as ggml_gated_delta_net_back documents
+    float * dq_base = (float *) dst->data;
+    float * dk_base = dq_base + ggml_nelements(src_v);
+    float * dv_base = dk_base + ggml_nelements(src_v);
+    float * dg_base = dv_base + ggml_nelements(src_v);
+    float * db_base = dg_base + ggml_nelements(src_g);
+    float * ds_base = db_base + ggml_nelements(src_beta);
+    float * scratch = ds_base + ggml_nelements(src_state);
+
+    const float * dy    = (const float *) src_dy->data;
+    const float * dy_st = dy + S * H * T * B;
+    const float * st_in = (const float *) src_state->data;
+
+    float * ea  = (float *) params->wdata + params->ith * (8 * S + CACHE_LINE_SIZE_F32);
+    float * ka  = ea + S;
+    float * u   = ka + S;
+    float * d   = u + S;
+    float * dd  = d + S;
+    float * du  = dd + S;
+    float * tmp = du + S;
+
+    // one work item is one value head of one sequence
+    const int64_t nr = H * B;
+    const int64_t dr = (nr + params->nth - 1) / params->nth;
+    const int64_t ir0 = dr * params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t ih = ir % H;
+        const int64_t is = ir / H;
+        const int64_t ik = ih % Hk;
+
+        float * ck  = scratch + ir * (nck + C + 1) * SS;  // the state at each chunk start
+        float * buf = ck + nck * SS;                       // the state before each token of a chunk
+        float * GM  = buf + C * SS;                        // gradient of the current state
+
+        #define GDN_Q(t) ((const float *) ((const char *) src_q->data + is * src_q->nb[3] + (t) * src_q->nb[2] + ik * src_q->nb[1]))
+        #define GDN_K(t) ((const float *) ((const char *) src_k->data + is * src_k->nb[3] + (t) * src_k->nb[2] + ik * src_k->nb[1]))
+        #define GDN_V(t) ((const float *) ((const char *) src_v->data + is * src_v->nb[3] + (t) * src_v->nb[2] + ih * src_v->nb[1]))
+        #define GDN_G(t) ((const float *) src_g->data + ((is * T + (t)) * H + ih) * ng)
+        #define GDN_B(t) (((const float *) src_beta->data)[(is * T + (t)) * H + ih])
+
+        // states at the chunk starts
+        memcpy(ck, st_in + (is * H + ih) * SS, SS * sizeof(float));
+        for (int64_t c = 0; c + 1 < nck; ++c) {
+            float * M = ck + (c + 1) * SS;
+            memcpy(M, ck + c * SS, SS * sizeof(float));
+            for (int64_t t = c * C; t < (c + 1) * C; ++t) {
+                gdn_gate(S, kda, GDN_G(t), ea);
+                gdn_step(S, kda, M, ea, GDN_K(t), GDN_V(t), GDN_B(t));
+            }
+        }
+
+        memcpy(GM, dy_st + (is * H + ih) * SS, SS * sizeof(float));
+
+        for (int64_t c = nck - 1; c >= 0; --c) {
+            const int64_t t0 = c * C;
+            const int64_t t1 = MIN(T, t0 + C);
+            memcpy(buf, ck + c * SS, SS * sizeof(float));
+            for (int64_t t = t0; t + 1 < t1; ++t) {
+                float * M = buf + (t - t0 + 1) * SS;
+                memcpy(M, M - SS, SS * sizeof(float));
+                gdn_gate(S, kda, GDN_G(t), ea);
+                gdn_step(S, kda, M, ea, GDN_K(t), GDN_V(t), GDN_B(t));
+            }
+            for (int64_t t = t1 - 1; t >= t0; --t) {
+                const float * Mp = buf + (t - t0) * SS;  // state before token t
+                const float * q  = GDN_Q(t);
+                const float * k  = GDN_K(t);
+                const float * v  = GDN_V(t);
+                const float beta = GDN_B(t);
+                const int64_t o  = ((is * T + t) * H + ih) * S;
+                const float * dO = dy + o;
+                float * dq = dq_base + o;
+                float * dk = dk_base + o;
+                float * dv = dv_base + o;
+                float * dg = dg_base + ((is * T + t) * H + ih) * ng;
+
+                gdn_gate(S, kda, GDN_G(t), ea);
+                for (int64_t i = 0; i < S; ++i) {
+                    ka[i] = (kda ? ea[i] : ea[0]) * k[i];
+                }
+                // u = M'^T k with M' = exp(g) * Mp; d = beta (v - u)
+                for (int64_t j = 0; j < S; ++j) {
+                    float s = 0.0f;
+                    ggml_vec_dot_f32(S, &s, 0, Mp + j * S, 0, ka, 0, 1);
+                    u[j] = s;
+                    d[j] = beta * (v[j] - s);
+                }
+
+                // o = scale M_t^T q, M_t[j][i] = ea_i Mp[j][i] + d[j] k[i]
+                float dOd = 0.0f;
+                ggml_vec_dot_f32(S, &dOd, 0, dO, 0, d, 0, 1);
+                memset(tmp, 0, S * sizeof(float));
+                for (int64_t j = 0; j < S; ++j) {
+                    ggml_vec_mad_f32(S, tmp, Mp + j * S, dO[j]);
+                }
+                for (int64_t i = 0; i < S; ++i) {
+                    dq[i] = scale * ((kda ? ea[i] : ea[0]) * tmp[i] + k[i] * dOd);
+                }
+                for (int64_t j = 0; j < S; ++j) {
+                    ggml_vec_mad_f32(S, GM + j * S, q, scale * dO[j]);
+                }
+
+                // M_t = M' + d k^T
+                memset(dk, 0, S * sizeof(float));
+                for (int64_t j = 0; j < S; ++j) {
+                    float s = 0.0f;
+                    ggml_vec_dot_f32(S, &s, 0, GM + j * S, 0, k, 0, 1);
+                    dd[j] = s;
+                    ggml_vec_mad_f32(S, dk, GM + j * S, d[j]);
+                }
+
+                // d = beta (v - u)
+                float db = 0.0f;
+                for (int64_t j = 0; j < S; ++j) {
+                    db += dd[j] * (v[j] - u[j]);
+                    dv[j] = beta * dd[j];
+                    du[j] = -beta * dd[j];
+                }
+                db_base[(is * T + t) * H + ih] = db;
+
+                // u = M'^T k
+                memset(tmp, 0, S * sizeof(float));
+                for (int64_t j = 0; j < S; ++j) {
+                    ggml_vec_mad_f32(S, tmp, Mp + j * S, du[j]);
+                    ggml_vec_mad_f32(S, GM + j * S, k, du[j]);
+                }
+                for (int64_t i = 0; i < S; ++i) {
+                    dk[i] += (kda ? ea[i] : ea[0]) * tmp[i];
+                }
+
+                // M' = exp(g) * Mp
+                if (kda) {
+                    memset(tmp, 0, S * sizeof(float));
+                    for (int64_t j = 0; j < S; ++j) {
+                        for (int64_t i = 0; i < S; ++i) {
+                            tmp[i] += GM[j * S + i] * Mp[j * S + i];
+                        }
+                        ggml_vec_mul_f32(S, GM + j * S, GM + j * S, ea);
+                    }
+                    for (int64_t i = 0; i < S; ++i) {
+                        dg[i] = tmp[i] * ea[i];
+                    }
+                } else {
+                    float da = 0.0f;
+                    ggml_vec_dot_f32(SS, &da, 0, GM, 0, Mp, 0, 1);
+                    dg[0] = da * ea[0];
+                    ggml_vec_scale_f32(SS, GM, ea[0]);
+                }
+            }
+        }
+        memcpy(ds_base + (is * H + ih) * SS, GM, SS * sizeof(float));
+
+        #undef GDN_Q
+        #undef GDN_K
+        #undef GDN_V
+        #undef GDN_G
+        #undef GDN_B
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_gated_delta_net_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 
 // ggml_compute_forward_dsv4_hc_comb
 
